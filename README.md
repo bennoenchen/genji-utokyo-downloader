@@ -1,68 +1,106 @@
-# Genji Kiritsubo Downloader
+# UTokyo Genji Collection Downloader (Prototype)
 
-Ein kleines Python-Skript, das die im UTokyo Digital Archive verlinkten IIIF-Bildseiten eines einzelnen Genji-Eintrags herunterlädt und daraus eine PDF erzeugt.
+Ein experimenteller Python-Prototyp, der die Genji-Sammlungsseite im UTokyo Digital Archive durchsucht, UUIDs sammelt, Metadaten und IIIF-Manifeste ausprobiert, Bildseiten lädt und nach Möglichkeit PDFs erstellt.
 
-> **Status:** Experimenteller Einzelobjekt-Downloader. Der im Skript eingetragene Manifest-Endpunkt und die Zuordnung der UUID zu 桐壺 müssen gegen das aktuelle Archiv geprüft werden. Das Skript wurde in diesem Projekt nicht als vollständig erfolgreich heruntergeladen verifiziert.
+> **Wichtige Einschränkung:** Dies ist ausdrücklich ein **Prototyp, kein zuverlässiger Vollsammlungs-Downloader**. Die aktuelle Link-Erkennung kann die Genji-Sammlung verlassen und andere Sammlungen oder allgemeine Archivseiten ansteuern. Das wurde im Laufprotokoll beobachtet. Bitte nicht unbeaufsichtigt auf die ganze Sammlung loslassen, bevor die Erkennung gezielt repariert und getestet wurde.
 
-## Funktionen
+## Funktionen des vorhandenen Prototyps
 
-- Ruft ein fest eingetragenes IIIF-Manifest ab.
-- Unterstützt typische Strukturen der IIIF Presentation API 2 und 3.
-- Lädt erkannte Seitenbilder herunter und prüft, ob die Antworten Bilddateien sind.
-- Erstellt aus den geladenen Bildern eine PDF.
-- Speichert das Manifest bei unerwarteter Struktur zur Diagnose.
+- Startet bei `https://da.dl.itc.u-tokyo.ac.jp/portal/en/collection/genji`.
+- Sammelt UUIDs aus erkannten Links.
+- Ruft JSON-Metadaten und mögliche IIIF-Manifeste ab.
+- Unterstützt übliche IIIF-Presentation-2- und -3-Strukturen.
+- Lädt Bilder herunter und erstellt optional PDFs.
+- Schreibt `discovery.json`, `summary.json`, Metadaten und Manifestkopien zur Diagnose.
+- Wartet zwischen Anfragen und überspringt bereits vorhandene Bilddateien.
 
-Die PDF enthält **Manuskriptbilder**, keine Transkription und keine OCR.
+Die Erkennung ist heuristisch und kann unvollständig sein. Sie kann Einträge übersehen oder irrelevante UUIDs aufnehmen.
 
 ## Voraussetzungen
 
 - Python 3.10 oder neuer empfohlen
 - Internetzugang
-- Die Bibliotheken `requests` und `Pillow`
+- Python-Pakete `requests`, `Pillow` und `beautifulsoup4`
 
 ## Installation unter Windows
 
-Öffne PowerShell im Repository-Ordner und führe aus:
+Öffne PowerShell im Repository-Ordner:
 
 ```powershell
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install requests pillow
+python -m pip install -r requirements.txt
 ```
 
-Falls PowerShell die Aktivierung blockiert, kannst du das Skript auch ohne Aktivierung starten, indem du `.venv\Scripts\python.exe` verwendest.
+Ohne Aktivierung kann `.venv\Scripts\python.exe` verwendet werden.
 
-## Start
+## Aufruf
+
+Kleiner Testlauf (der Prototyp kann dennoch zusätzliche Suchseiten besuchen):
 
 ```powershell
-python download_genji_kiritsubo.py
+python download_all_genji.py --max-items 1 --max-pages 3 --delay 1.0
 ```
+
+Nur Bilder, keine PDFs:
+
+```powershell
+python download_all_genji.py --max-items 3 --no-pdf --delay 1.0
+```
+
+Hilfe zu allen vorhandenen Optionen:
+
+```powershell
+python download_all_genji.py --help
+```
+
+Optionen:
+
+- `--max-items N`: bearbeitet höchstens N gefundene UUIDs.
+- `--max-pages N`: begrenzt die Zahl besuchter Suchseiten (Standard: 100).
+- `--delay SEKUNDEN`: Pause zwischen Anfragen (Standard: 0.35 Sekunden).
+- `--no-pdf`: Bilder laden, aber keine PDFs erstellen.
+- `--retry-failed`: ist zwar als CLI-Option definiert, wird im aktuellen Programmablauf aber nicht ausgewertet und hat daher derzeit keine Wirkung. Vor einer Veröffentlichung entfernen oder korrekt implementieren.
 
 ## Ausgabe
 
-Das Skript erstellt den Ordner `Genji_Kiritsubo/`. Er soll die Seitenbilder `seite_0001.jpg`, `seite_0002.jpg` usw. sowie `Genji_Kiritsubo.pdf` enthalten. Wenn das Manifest nicht gelesen oder kein Bild erkannt wird, kann auch eine `manifest.json` zur Fehlerdiagnose entstehen.
+Der Standard-Ausgabeordner heißt `UTokyo_Genji_Archive/`. Darin können unter anderem entstehen:
 
-## Fehlerbehebung
+- `discovery.json`: gefundene UUIDs und Links
+- `summary.json`: Status pro bearbeitetem Eintrag
+- `metadata_<UUID>.json`: Rohmetadaten
+- pro Eintrag ein Ordner mit `manifest.json`, `manifest_url.txt`, `images/` und optionaler PDF
+- `*.failed.txt`: Fehlerhinweise zu fehlgeschlagenen Bildern
 
-- **HTTP 403/404 oder Verbindungsabbruch:** Der Archiv-Endpunkt kann geändert sein, Anfragen begrenzen oder vorübergehend nicht erreichbar sein. Nicht mit zufälligen URLs fortfahren; Manifest im Browser und im Network-Tab der Entwicklerwerkzeuge prüfen.
-- **Keine Bild-URLs:** `manifest.json` ansehen und die tatsächliche IIIF-Struktur prüfen. IIIF-2- und IIIF-3-Manifeste unterscheiden sich.
-- **PDF fehlt oder unvollständig:** Im Konsolenprotokoll nach Bildfehlern suchen. Erfolgreich geladene Bilder können trotzdem gespeichert worden sein.
-- **Leere/unerwartete Dateien:** Die HTTP-Antwort allein genügt nicht; kontrolliere Dateigröße und ob sie sich als Bild öffnen lässt.
+## Bekannte Probleme aus dem Testlauf
 
-## Datenschutz, Rechte und verantwortungsvolle Nutzung
+Im protokollierten Lauf besuchte das Programm URLs wie `/portal/en/collection`, `/portal/collection/asia` und `/portal/collection/agawa`, also Seiten außerhalb der Genji-Sammlung. Außerdem traten `403 Forbidden` und `RemoteDisconnected` auf. Solche Meldungen sind Server-/Zugriffsantworten; sie beweisen nicht allein, dass die lokale Internetverbindung defekt ist.
 
-Das Skript sendet Anfragen an den Server des Archivs. Verwende es nur für öffentlich zugängliche Inhalte, halte die Abrufrate niedrig und beachte die aktuellen Nutzungs- und Wiederverwendungsbedingungen des Archivs: <https://www.lib.u-tokyo.ac.jp/ja/library/general/reuse>. Prüfe die Rechteangaben für den konkreten Datensatz selbst. Öffentliche Abrufbarkeit ist nicht automatisch eine allgemeine Erlaubnis für jede Nutzung.
+Die Ursache liegt vor allem in der generischen Regel, die Links mit Wörtern wie `collection`, `assets`, `page` oder JSON-Endungen in die Warteschlange legt. Vor einer Vollsammlung muss das ersetzt werden durch eine exakt begrenzte Erkennung von Genji-Paginierungsseiten und den offiziell referenzierten Datensatz-Links. Nur die Ausgangs-URL auf `/collection/genji` zu setzen, reicht nicht.
 
-## Nutzung von KI bei der Weiterentwicklung
+## Empfohlene sichere Weiterentwicklung
 
-KI kann beim Erklären von Fehlermeldungen, beim Prüfen von Manifest-JSON und beim Ergänzen von Tests helfen. Gib der KI bei Fehlern den vollständigen Traceback, Python-Version, Betriebssystem und ein anonymisiertes Manifest-Beispiel. Lass sie nicht raten, welche URL funktionieren müsste: Bitte sie, den verwendeten Endpunkt anhand belegbarer Daten zu prüfen und Unsicherheiten ausdrücklich zu markieren.
+1. Im Browser die Genji-Sammlungsseite öffnen.
+2. In den Entwicklerwerkzeugen unter **Network** prüfen, welche Requests beim Seitenwechsel bzw. beim Laden weiterer Ergebnisse ausgelöst werden.
+3. Das echte Paginierungs-/Suchschema und den echten IIIF-Manifest-Link eines einzelnen Eintrags ermitteln.
+4. Eine Allowlist zulässiger Pfade definieren. Keine beliebige `collection`- oder `assets`-URL automatisch als nächste Crawl-Seite behandeln.
+5. Mit einem einzigen Eintrag testen und prüfen, ob Titel, UUID, Manifest, Anzahl Bilder und Reihenfolge stimmen.
+6. Erst danach schrittweise auf mehr Einträge ausweiten.
 
-Beispielprompt:
+## Nutzung von KI
 
-> Prüfe dieses Python-Skript für den Download eines einzelnen IIIF-Manifests. Ändere nur, was nötig ist. Unterstütze IIIF Presentation API 2 und 3, sortiere Bilder in Manifestreihenfolge, behandle HTTP-Fehler mit aussagekräftigen Meldungen und schreibe Tests mit lokalen Beispiel-Manifests. Behaupte nicht, dass der UTokyo-Endpunkt funktioniert, wenn er nicht tatsächlich verifiziert wurde. Erkläre jeden geänderten Teil.
+KI eignet sich, um den Code zu erklären, HTML/JSON-Beispiele zu analysieren und Regressionstests zu entwerfen. Sie sollte nicht dazu verwendet werden, Endpunkte oder Archivstrukturen zu erfinden. Stelle der KI diesen Kontext und die relevanten Dateien/Antworten bereit, und verlange, dass sie unbestätigte Annahmen klar kennzeichnet.
 
-KI-generierten Code erst prüfen und mit einem einzelnen Datensatz testen, bevor große Downloads starten.
+Beispielprompt zur Korrektur:
+
+> Repariere diesen Downloader so, dass er ausschließlich Datensätze findet, die tatsächlich zur UTokyo-Genji-Sammlung gehören. Lies zuerst den vorhandenen Code und diese Laufprotokolle. Erfinde keine API-Endpunkte. Entwirf eine Discovery-Funktion mit expliziter Allowlist und dokumentierter Paginierung; wenn das reale Schema nicht belegt ist, baue einen Diagnosemodus statt eines geratenen Crawlers. Ergänze Tests mit gespeicherten HTML-/JSON-Fixtures, einen Dry-Run-Modus, Wiederholungen mit Backoff und eine übersichtliche Fehlerzusammenfassung. Zeige alle Änderungen und erkläre, wie ich sie lokal prüfen kann.
+
+KI-Ausgaben nicht ungeprüft übernehmen. Vor einem Commit: `--max-items 1`, kurze Laufgrenzen, keine unnötige parallele Last und Prüfen von `discovery.json`.
+
+## Archivbedingungen
+
+Beachte die aktuellen Nutzungsbedingungen und Wiederverwendungsangaben des UTokyo-Archivs: <https://www.lib.u-tokyo.ac.jp/ja/library/general/reuse>. Prüfe die Lizenz und Metadaten jedes Datensatzes. Öffentliche Sichtbarkeit bedeutet nicht automatisch, dass jede Weiterverwendung erlaubt ist.
 
 ## Projektstruktur
 
@@ -71,5 +109,5 @@ KI-generierten Code erst prüfen und mit einem einzelnen Datensatz testen, bevor
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
-└── download_genji_kiritsubo.py
+└── download_all_genji.py
 ```
