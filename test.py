@@ -1,4 +1,4 @@
-"""Offline tests; run with: py -m unittest -v test_genji_download.py"""
+"""Offline tests; run with: py -m unittest -v test.py"""
 import io
 import tempfile
 import unittest
@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
-import genji_download as g
+import download_genji_collection as g
 
 
 SAMPLE_HTML = '''<html><body>
