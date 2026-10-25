@@ -1,94 +1,128 @@
-# Genji Collection Downloader
+# Genji Monogatari Downloader
 
-- Standard ist `--source collection`: Es werden direkt auf der Genji-Landingpage verlinkte Einträge verarbeitet. Das ist nur eine Vorschau, kein vollständiger Katalog.
-- `--source api` versucht die breitere Suche am Archiv-Suchendpunkt.
-- `--collection-html PFAD` liest eine lokale HTML-Datei statt die Sammlungsseite live abzurufen.
-- Eine erfolgreich geladene Live-Sammlungsseite wird im Ausgabeordner als `collection_genji.html` gespeichert. Falls ein späterer Live-Abruf scheitert, wird dieser Cache verwendet, sofern vorhanden.
-- Ein vorhandener Eintragsordner mit derselben UUID wird bevorzugt weiterverwendet, damit bereits gespeicherte Bilder nicht wegen eines geänderten oder fehlenden Titels verloren gehen.
+Lädt die digitalisierten historischen Handschriften des Genji Monogatari (源氏物語) aus dem Digitalarchiv der Universität Tokio herunter und erstellt daraus eine vollständige lokale Sammlung.
+
+Die finale Version verwendet eine lokal gespeicherte `genji.html`, die alle 54 Kapitel der Sammlung enthält. Dadurch entfällt die fehleranfällige Online-Erkennung früherer Versionen und der Download erfolgt reproduzierbar.
+
+## Funktionen
+
+- Download aller 54 Kapitel
+- Nutzung der offiziellen UTokyo-Asset-UUIDs
+- Speicherung der Metadaten (`manifest.json`)
+- Download der hochauflösenden Manuskriptbilder
+- Automatische Erstellung einer PDF pro Kapitel
+- Optionale Gesamt-PDF aller Kapitel
+- Wiederaufnahme unterbrochener Downloads
+- Überspringen bereits vorhandener Dateien
+- Fortschrittsanzeige während des Downloads
+
+## Projektstruktur
+
+```
+genji-downloader-54/
+├── genji_download.py
+├── genji.html
+├── test_genji_download.py
+├── requirements.txt
+├── .gitignore
+└── README.md
+```
 
 ## Voraussetzungen
 
 - Python 3.10 oder neuer
-- Internetzugang für Live-Abrufe; bei einer passenden lokalen HTML-Datei ist dieser für die Erkennung nicht zwingend erforderlich
-- Pakete aus `requirements.txt`: `requests`, `beautifulsoup4` und `Pillow`
+- Windows, Linux oder macOS
+- Internetverbindung
 
-## Installation unter Windows / PowerShell
+## Installation
 
-```powershell
+### Windows
+
+```
 py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-## Starten
+### Linux / macOS
 
-Optionen anzeigen:
-
-```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-6.py --help
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Standardmodus nur zur Erkennung und Prüfung verwenden:
+## Verwendung
 
-```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-6.py --source collection --discover-only
+### Download aller Kapitel
+
+```
+python download_genji_collection.py
 ```
 
-Eine lokal gespeicherte HTML-Datei verwenden:
+### Tests ausführen
 
-```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-6.py --collection-html .\genji-collection.html --discover-only
+```
+python test.py
 ```
 
-Die HTML-Datei muss die Asset-Links der Genji-Sammlungsseite enthalten. Eine beliebige Suchergebnisseite ist nicht automatisch geeignet.
+## Ausgabe
 
-Die breitere Suche ausdrücklich aktivieren:
+Nach erfolgreichem Download entsteht beispielsweise folgende Struktur:
 
-```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-6.py --source api --discover-only
+```
+output/
+├── chapter_01_桐壺/
+│   ├── manifest.json
+│   ├── page_0001.jpg
+│   ├── page_0002.jpg
+│   └── chapter.pdf
+├── chapter_02_帚木/
+│   └── ...
+├── ...
+└── Genji_Monogatari_Complete.pdf
 ```
 
-Mit der eingebauten Test-UUID testen:
+## Abhängigkeiten
 
-```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-6.py --test-uuid
+`requirements.txt`
+
+```
+requests
+beautifulsoup4
+Pillow
+img2pdf
 ```
 
-Höchstens zwei Einträge verarbeiten:
+## Bekannte Einschränkungen
 
-```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-6.py --max-items 2
-```
+- Das Projekt hängt von der Verfügbarkeit des UTokyo-Digitalarchivs ab.
+- Änderungen an der IIIF-API oder den Asset-URLs können Anpassungen erforderlich machen.
+- Einzelne Kapitel können serverseitig zeitweise nicht erreichbar sein; vorhandene Dateien werden bei einem erneuten Lauf nicht erneut heruntergeladen.
 
-## Wichtige Optionen
+## Entwicklung mit KI
 
-| Option | Bedeutung |
-|---|---|
-| `--source collection` | Standard: direkt verlinkte Einträge der Genji-Landingpage |
-| `--source api` | Versucht den breiteren Suchmodus; kann durch Serverbeschränkungen scheitern |
-| `--collection-html PFAD` | Lokale HTML-Datei verwenden; nicht mit `--source api` kombinieren |
-| `--collection-preview` | Veralteter Alias für den Collection-Modus |
-| `--test-uuid` | Nur die im Skript hinterlegte Test-UUID verwenden |
-| `--discover-only` | Einträge suchen und prüfen, ohne Bilder herunterzuladen |
-| `--output PFAD` | Ausgabeordner; Standard: `UTokyo_Genji_Archive` |
-| `--max-items N` | Höchstens N Einträge verarbeiten |
-| `--max-pages N` | Maximale Suchseitenzahl im API-Modus; Standard: `100` |
-| `--delay SEKUNDEN` | Pause zwischen Anfragen; mindestens `0.3`, Standard: `0.5` |
-| `--timeout SEKUNDEN` | HTTP-Zeitlimit; Standard: `25` |
-| `--retries N` | Wiederholungsversuche; Standard: `2` |
-| `--no-pdf` | PDF-Erstellung ausschalten |
-| `--allow-partial-pdf` | PDF trotz fehlender Seiten erzeugen |
-| `--rebuild-pdf` | Bestehende PDFs neu erzeugen |
-| `--full-resolution` | Versucht, verfügbare Bildgröße über IIIF `info.json` auszuhandeln |
+Dieses Projekt entstand iterativ mit Unterstützung einer KI und wurde über mehrere Versionen weiterentwickelt.
 
-Die vollständige Optionsliste steht in `--help`.
+### Bewährter Workflow
 
-## Ausgaben und Fehlerprüfung
+1. Kleine Änderungen einzeln umsetzen.
+2. Neue Funktionen zunächst an einem Kapitel testen.
+3. Anschließend den vollständigen Lauf über alle 54 Kapitel prüfen.
+4. Bei Änderungen an der Archivstruktur zuerst `genji.html` und die IIIF-Manifeste überprüfen.
 
-Standardmäßig liegen die Ergebnisse in `UTokyo_Genji_Archive`. Dort können `collection_genji.html`, `discovery.json`, `summary.json`, `errors.json`, Metadaten, IIIF-Manifeste, Bilder, Statusdateien und PDFs entstehen. Prüfe die Status- und Fehlerdateien, bevor du PDFs als vollständig behandelst.
+### Nützlicher Prompt für Weiterentwicklungen
 
-Der lokale HTML-Cache hilft bei vorübergehenden Problemen, ersetzt aber keine vollständige Katalogsuche. Bei `403`, `429` oder Verbindungsabbrüchen zuerst den Erkennungsmodus verwenden, die Anfragen verlangsamen und später erneut versuchen.
+> Erweitere den bestehenden `download_genji_collection.py`, ohne die bestehende Downloadlogik zu verändern. Nutze weiterhin `genji.html` als Quelle für die 54 Kapitel, achte auf Kompatibilität mit der IIIF Presentation API und erhalte die Wiederaufnahme bereits heruntergeladener Dateien.
 
-## Nutzung von KI zur Weiterentwicklung
+## Datenquelle
 
-Gib einer KI die genaue Fehlermeldung, den Startbefehl, die Python-Version und relevante Statusdateien. Bitte sie, zuerst die Ursache zu erklären und dann einen kleinen, testbaren Patch vorzuschlagen. API-Endpunkte, UUID-Titel-Zuordnungen und erfolgreiche Downloads dürfen nicht geraten werden. Teste Änderungen zunächst mit einer gespeicherten HTML-Datei oder `--discover-only`, prüfe den Code mit `git diff` und lade erst danach einzelne Einträge herunter.
+Digital Archive der Universität Tokio (UTokyo).
+
+Die Manuskriptbilder stammen aus den öffentlich zugänglichen Digitalisaten der Genji-Monogatari-Sammlung der Universität Tokio. Bitte beachte die jeweiligen Nutzungsbedingungen des Archivs für Weiterverwendung oder Veröffentlichung der heruntergeladenen Bilder.
+
+## Lizenz
+
+Dieses Repository enthält ausschließlich den Downloader und Hilfsdateien.
+
+Die heruntergeladenen Digitalisate stammen von der Universität Tokio und unterliegen den dort angegebenen Nutzungsbedingungen.

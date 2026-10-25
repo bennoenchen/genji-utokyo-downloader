@@ -1,503 +1,376 @@
 #!/usr/bin/env python3
-"""Conservative, resumable downloader for UTokyo's Genji manuscript collection.
+"""Download UTokyo's 54 Genji manuscripts from a locally saved search HTML.
 
-The default discovers the four-or-so visible items on the collection's landing
-page. A separate opt-in API mode attempts exhaustive discovery. Both modes
-independently verify collection membership before requesting images.
+Usage: py genji_download.py --html genji.html --max-chapters 2
+       py genji_download.py --html genji.html
 """
 import argparse
 import io
 import json
 import logging
 import re
+import shutil
 import sys
 import time
-import unicodedata
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
+import img2pdf
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image
+from pypdf import PdfReader, PdfWriter
 
-BASE = "https://da.dl.itc.u-tokyo.ac.jp"
-SEARCH = BASE + "/portal/search"
-COLLECTION = BASE + "/portal/en/collection/genji"
-UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
-ASSET_RE = re.compile(r"/portal/(?:en/)?assets/([0-9a-f-]{36})(?:[/?#]|$)", re.I)
-TEST_UUID = "c1ea8e6b-9403-4394-8619-96aad0ec6329"
+
+HOST = "https://da.dl.itc.u-tokyo.ac.jp"
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+CHAPTERS = (
+    "桐壺", "帚木", "空蝉", "夕顔", "若紫", "末摘花", "紅葉加(紅葉賀)", "花宴", "葵", "龍眼木(賢木 , 榊)",
+    "花散里", "須磨", "赤石(明石)", "水衝石(澪標)", "蓬生", "関屋", "檜合", "松風", "薄雲", "槿",
+    "乙女", "玉鬘", "初音", "胡蝶", "蛍", "床夏(常夏)", "篝火", "野分", "行幸", "蘭(藤袴)",
+    "真木柱", "梅枝", "藤裏葉", "若菜 上", "若菜 下", "柏木", "横笛", "鈴虫", "夕霧", "御法",
+    "幻", "匂宮", "紅梅", "竹川", "橋姫", "椎本", "総角", "早蕨", "寄生", "東屋",
+    "浮舟", "蜻蛉", "手習", "夢浮橋",
+)
+ORDINAL = {name: index for index, name in enumerate(CHAPTERS, 1)}
 LOG = logging.getLogger("genji")
 
 
-def dump(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".part")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+def write_json(path, obj):
+    temporary = path.with_suffix(path.suffix + ".part")
+    temporary.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
-def safe_name(name):
-    name = unicodedata.normalize("NFKC", str(name or "Untitled"))
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
-    return (name[:90] or "Untitled")
+def parse_html(path):
+    """Only read real asset records, never site navigation or related links."""
+    soup = BeautifulSoup(path.read_text(encoding="utf-8-sig"), "html.parser")
+    entries, seen_uuids, seen_titles = [], set(), set()
+    for article in soup.select('article[about^="/portal/assets/"]'):
+        asset_id = article.get("about", "").rsplit("/", 1)[-1].lower()
+        link = article.select_one('a[rel="bookmark"]')
+        title = link.get_text(" ", strip=True) if link else ""
+        if not UUID.fullmatch(asset_id) or title not in ORDINAL:
+            raise ValueError(f"Unrecognized Genji record in HTML: {asset_id} {title!r}")
+        if asset_id in seen_uuids or title in seen_titles:
+            raise ValueError(f"Duplicate UUID or chapter title in HTML: {title}")
+        seen_uuids.add(asset_id)
+        seen_titles.add(title)
+        number = ORDINAL[title]
+        # Every title here is the catalog's exact Japanese spelling.
+        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(" .")
+        entries.append({"number": number, "title": title, "uuid": asset_id,
+                        "folder": f"{number:02d}_{safe}"})
+    if not entries:
+        raise ValueError("No manuscript records in HTML. Save the search result page as HTML.")
+    return sorted(entries, key=lambda entry: entry["number"])
 
 
-def localized(value):
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return next((localized(x) for x in value if localized(x)), "")
-    if isinstance(value, dict):
-        for key in ("ja", "none", "en", "@value", "value", "title", "label"):
-            if key in value:
-                return localized(value[key])
-    return ""
-
-
-def html_title(soup):
-    h = soup.find("h1")
-    return h.get_text(" ", strip=True) if h else ""
-
-
-class Client:
+class Http:
     def __init__(self, delay, timeout, retries):
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "GenjiManuscriptArchiver/1.0 (personal academic preservation)", "Accept": "application/json, application/ld+json, text/html;q=0.9, */*;q=0.5"})
+        self.session.headers["User-Agent"] = "UTokyo-Genji-personal-archiver/1.0"
         self.delay, self.timeout, self.retries = delay, timeout, retries
-        self.last = 0.0
+        self.previous = 0.0
 
-    def get(self, url, params=None, stream=False):
-        if urlparse(url).scheme != "https":
-            raise ValueError("Only HTTPS URLs are allowed: " + str(url))
+    def get(self, url, stream=False):
+        if not url.startswith(HOST + "/portal/") and not url.startswith("https://"):
+            raise ValueError(f"Unexpected URL: {url}")
         for attempt in range(self.retries + 1):
-            pause = self.delay - (time.monotonic() - self.last)
-            if pause > 0:
-                time.sleep(pause)
-            self.last = time.monotonic()
+            wait = self.delay - (time.monotonic() - self.previous)
+            if wait > 0:
+                time.sleep(wait)
+            self.previous = time.monotonic()
             try:
-                response = self.session.get(url, params=params, timeout=self.timeout,
-                                            stream=stream, allow_redirects=True)
+                response = self.session.get(url, timeout=self.timeout, stream=stream)
                 if response.status_code in (403, 429):
                     response.close()
-                    raise RuntimeError(f"HTTP {response.status_code}; no automatic retry: {url}")
+                    raise PermissionError(f"HTTP {response.status_code} (no automatic retry): {url}")
                 if response.status_code in (500, 502, 503, 504) and attempt < self.retries:
                     response.close()
                     time.sleep(min(2 ** attempt, 8))
                     continue
                 response.raise_for_status()
                 return response
-            except (requests.Timeout, requests.ConnectionError):
-                if attempt == self.retries:
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt >= self.retries:
                     raise
                 time.sleep(min(2 ** attempt, 8))
-        raise RuntimeError("Retry limit reached")
+        raise RuntimeError("Retry limit exhausted")
 
-    def json(self, url, params=None):
-        with self.get(url, params=params) as r:
-            return r.json()
-
-
-def candidate_uuids(payload):
-    """Extract asset identifiers only from explicit asset URLs/record IDs.
-
-    Never scoop arbitrary UUIDs from nested related-asset fields.
-    """
-    if isinstance(payload, list):
-        for obj in payload:
-            yield from candidate_uuids(obj)
-    elif isinstance(payload, dict):
-        # Search API formats vary. Walk result arrays, not every opaque field.
-        for key in ("results", "items", "data", "rows", "nodes", "search_results", "@graph"):
-            if isinstance(payload.get(key), (list, dict)):
-                yield from candidate_uuids(payload[key])
-        for key in ("url", "link", "uri", "id", "@id", "path", "uuid", "nid"):
-            v = payload.get(key)
-            if isinstance(v, str):
-                match = ASSET_RE.search(v)
-                if match:
-                    yield match.group(1).lower()
-                elif key == "uuid" and UUID_RE.fullmatch(v):
-                    yield v.lower()
+    def json(self, url):
+        with self.get(url) as response:
+            return response.json()
 
 
-def search_discovery(client, max_pages, page_size=20):
-    found = []
-    seen = set()
-    reports = []
-    for page in range(max_pages):
-        params = {"collection": "genji", "_format": "json", "items_per_page": page_size, "page": page}
-        data = client.json(SEARCH, params=params)
-        ids = list(dict.fromkeys(candidate_uuids(data)))
-        # Some Drupal formats return top-level records keyed by UUID.
-        if not ids and isinstance(data, dict):
-            for key in data:
-                if UUID_RE.fullmatch(key):
-                    ids.append(key.lower())
-        reports.append({"page": page, "uuids": ids, "response_type": type(data).__name__})
-        fresh = [u for u in ids if u not in seen]
-        seen.update(fresh)
-        found.extend(fresh)
-        LOG.info("Search page %s: %s records, %s new", page, len(ids), len(fresh))
-        if not ids:
-            break
-        if not fresh:
-            raise RuntimeError("Search page repeated without new UUIDs; pagination schema needs inspection")
-        if len(ids) < page_size:
-            break
-    else:
-        raise RuntimeError("Maximum search pages reached; raise --max-pages after inspection")
-    if not found:
-        raise RuntimeError("Search API returned no recognizable asset URLs; inspect its JSON before changing extraction")
-    return found, reports
-
-
-def preview_discovery(client, root, html_file=None):
-    """Read only asset links on the Genji collection landing page (not its search page).
-
-    This page advertises a small preview, not the complete inventory. Never
-    interpret these results as an exhaustive collection download.
-    """
-    cache = root / "collection_genji.html"
-    source = COLLECTION
-    if html_file:
-        markup = html_file.read_text(encoding="utf-8-sig")
-        source = str(html_file)
-    else:
-        try:
-            with client.get(COLLECTION) as response:
-                markup = response.text
-            cache.write_text(markup, encoding="utf-8")
-        except Exception as exc:
-            if not cache.is_file():
-                raise
-            LOG.warning("Collection page unavailable (%s); using saved HTML from previous successful run: %s", exc, cache)
-            markup = cache.read_text(encoding="utf-8")
-            source = str(cache)
-    soup = BeautifulSoup(markup, "html.parser")
-    ids = []
-    titles = {}
-    for link in soup.find_all("a", href=True):
-        url = urljoin(COLLECTION, link["href"])
-        if urlparse(url).netloc != urlparse(BASE).netloc:
-            continue
-        match = ASSET_RE.search(urlparse(url).path)
-        if match and match.group(1).lower() not in ids:
-            uuid = match.group(1).lower()
-            ids.append(uuid)
-            titles[uuid] = link.get_text(" ", strip=True)
-    if not ids:
-        raise RuntimeError("No Genji preview asset links found on collection landing page")
-    return ids, [{"mode": "collection-preview-only", "source": source,
-                  "uuids": ids, "titles": titles, "exhaustive": False}]
-
-
-def verify_asset(client, uuid):
-    url = f"{BASE}/portal/en/assets/{uuid}"
-    with client.get(url) as r:
-        soup = BeautifulSoup(r.text, "html.parser")
-    # Distinctive same-origin link to canonical Genji collection; not related
-    # material, arbitrary surrounding text, or a mere word match.
-    links = [urljoin(url, a.get("href", "")) for a in soup.find_all("a", href=True)]
-    member = any(urlparse(x).netloc == urlparse(BASE).netloc and
-                 re.fullmatch(r"/portal/(?:en/)?collection/genji/?", urlparse(x).path)
-                 for x in links)
-    if not member:
-        raise ValueError("Asset detail page does not link to the Genji collection")
-    manifests = [x for x in links if re.search(r"/portal/repo/iiif/" + re.escape(uuid) + r"/manifest/?$", urlparse(x).path, re.I)]
-    if not manifests:
-        raise ValueError("No matching IIIF manifest linked from verified detail page")
-    return {"uuid": uuid, "title": html_title(soup) or uuid,
-            "detail_url": url, "manifest_url": manifests[0], "collection": "genji"}
-
-
-def extract_pages(manifest):
-    """Return ordered (canvas label, image URL, service IDs) from IIIF v2/v3."""
-    result = []
-    if manifest.get("sequences") is not None:  # Presentation 2
-        canvases = [c for s in manifest.get("sequences", []) for c in s.get("canvases", [])]
-        for canvas in canvases:
-            images = canvas.get("images", [])
-            resource = (images[0].get("resource") or {}) if images else {}
-            if isinstance(resource, str):
-                resource = {"@id": resource}
-            result.append({"label": localized(canvas.get("label")),
-                           "url": resource.get("@id") or resource.get("id"),
-                           "services": service_ids(resource.get("service"))})
-    elif manifest.get("items") is not None:  # Presentation 3
-        for canvas in manifest.get("items", []):
-            body = None
-            for page in canvas.get("items", []):
-                for annotation in page.get("items", []):
-                    if annotation.get("motivation") in ("painting", ["painting"]):
-                        body = annotation.get("body")
-                        break
-                if body is not None:
+def page_images(manifest):
+    """IIIF Presentation API v2 and v3, preserving canvas order."""
+    pages = []
+    if "sequences" in manifest:
+        for sequence in manifest["sequences"]:
+            for canvas in sequence.get("canvases", []):
+                annotations = canvas.get("images", [])
+                resource = annotations[0].get("resource", {}) if annotations else {}
+                if isinstance(resource, str):
+                    resource = {"@id": resource}
+                pages.append(resource.get("@id") or resource.get("id"))
+    elif "items" in manifest:
+        for canvas in manifest["items"]:
+            url = None
+            for layer in canvas.get("items", []):
+                for annotation in layer.get("items", []):
+                    if annotation.get("motivation") != "painting":
+                        continue
+                    body = annotation.get("body", {})
+                    if isinstance(body, list):
+                        body = next((b for b in body if isinstance(b, dict) and b.get("type") == "Image"), {})
+                    if isinstance(body, str):
+                        body = {"id": body}
+                    url = body.get("id") or body.get("@id")
                     break
-            if isinstance(body, list):
-                body = next((x for x in body if isinstance(x, dict) and x.get("type") == "Image"), None)
-            if isinstance(body, str):
-                body = {"id": body}
-            body = body or {}
-            result.append({"label": localized(canvas.get("label")),
-                           "url": body.get("id") or body.get("@id"),
-                           "services": service_ids(body.get("service"))})
+                if url:
+                    break
+            pages.append(url)
     else:
-        raise ValueError("Not a recognized IIIF Presentation v2 or v3 manifest")
-    return result
+        raise ValueError("Unknown IIIF manifest format")
+    if not pages or any(not u for u in pages):
+        raise ValueError("IIIF manifest has no images or contains an empty canvas")
+    return pages
 
 
-def service_ids(service):
-    if isinstance(service, dict):
-        return [service.get("id") or service.get("@id")] if (service.get("id") or service.get("@id")) else []
-    if isinstance(service, list):
-        return [sid for item in service for sid in service_ids(item)]
-    return []
+def valid_image(path):
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (OSError, ValueError):
+        return False
 
 
-def image_sources(page, full_size=False):
-    """Prefer the manifest's explicit image URL; don't assume a universal IIIF syntax.
-
-    Optional full-size requests are attempted only after inspecting Image API
-    info.json to learn the service version and maxima.
-    """
-    url = page.get("url")
-    sources = [url] if url else []
-    if full_size:
-        sources += [(s.rstrip("/") + "/info.json") for s in page["services"] if s]
-    return sources
-
-
-def negotiated_image_url(client, page):
-    for sid in page.get("services", []):
-        if not sid:
-            continue
-        info = client.json(sid.rstrip("/") + "/info.json")
-        context = json.dumps(info.get("@context", ""))
-        protocol = info.get("protocol", "")
-        if "image/3" in context or "image/3" in protocol:
-            size = "max"
-        elif "image/2" in context or "image/2" in protocol:
-            size = "full"
-        else:
-            continue
-        width, height = info.get("width"), info.get("height")
-        if not isinstance(width, int) or not isinstance(height, int):
-            continue
-        # Image API 2/3 may restrict maximum area/width/height.
-        limits = []
-        if info.get("maxWidth"):
-            limits.append(info["maxWidth"] / width)
-        if info.get("maxHeight"):
-            limits.append(info["maxHeight"] / height)
-        if info.get("maxArea"):
-            limits.append((info["maxArea"] / (width * height)) ** .5)
-        factor = min([1.0] + limits)
-        if factor < 1:
-            size = f"{max(1, int(width * factor))},"
-        return sid.rstrip("/") + f"/full/{size}/0/default.jpg"
-    return page.get("url")
-
-
-def save_image(client, url, prefix):
-    if not url:
-        raise ValueError("No image resource URL in canvas")
-    with client.get(url, stream=True) as response:
-        chunks = io.BytesIO()
-        for piece in response.iter_content(128 * 1024):
-            chunks.write(piece)
-            if chunks.tell() > 600 * 1024 * 1024:
-                raise ValueError("Image exceeds 600 MB safety limit")
-        raw = chunks.getvalue()
-    with Image.open(io.BytesIO(raw)) as img:
-        img.verify()
-    with Image.open(io.BytesIO(raw)) as img:
-        fmt = (img.format or "").upper()
-    ext = {"JPEG": ".jpg", "PNG": ".png", "TIFF": ".tif", "WEBP": ".webp", "JP2": ".jp2"}.get(fmt)
-    if not ext:
-        raise ValueError("Unsupported image format: " + fmt)
-    target = prefix.with_suffix(ext)
-    temp = target.with_suffix(ext + ".part")
-    temp.write_bytes(raw)
-    temp.replace(target)
-    return target
-
-
-def existing_image(prefix):
-    for path in sorted(prefix.parent.glob(prefix.name + ".*")):
-        if path.suffix not in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".jp2"):
-            continue
-        try:
-            with Image.open(path) as img:
-                img.verify()
+def find_image(folder, number):
+    for ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".jp2"):
+        path = folder / f"page_{number:04d}{ext}"
+        if path.is_file() and valid_image(path):
             return path
-        except (OSError, UnidentifiedImageError):
-            LOG.warning("Invalid existing image: %s", path)
     return None
 
 
-def create_pdf(paths, target):
-    # Page count is checked first; convert per page to RGB to support PNG/RGBA.
-    images = []
+def get_image(http, url, directory, number):
+    with http.get(url, stream=True) as response:
+        data = io.BytesIO()
+        for chunk in response.iter_content(131072):
+            data.write(chunk)
+            if data.tell() > 600_000_000:
+                raise ValueError("Image exceeded 600 MB safety limit")
+    raw = data.getvalue()
+    with Image.open(io.BytesIO(raw)) as image:
+        fmt = image.format
+        image.verify()
+    extension = {"JPEG": "jpg", "PNG": "png", "TIFF": "tif", "WEBP": "webp", "JPEG2000": "jp2"}.get(fmt)
+    if not extension:
+        raise ValueError(f"Unsupported image format: {fmt}")
+    target = directory / f"page_{number:04d}.{extension}"
+    temporary = directory / f"page_{number:04d}.{extension}.part"
+    temporary.write_bytes(raw)
+    temporary.replace(target)
+    return target
+
+
+def pdf_pages(path):
     try:
-        for path in paths:
-            with Image.open(path) as src:
-                fixed = ImageOps.exif_transpose(src)
-                if fixed.mode in ("RGBA", "LA") or "transparency" in fixed.info:
-                    bg = Image.new("RGB", fixed.size, "white")
-                    bg.paste(fixed.convert("RGBA"), mask=fixed.convert("RGBA").getchannel("A"))
-                    images.append(bg)
-                else:
-                    images.append(fixed.convert("RGB"))
-        temp = target.with_suffix(".pdf.part")
-        images[0].save(temp, format="PDF", save_all=True, append_images=images[1:], resolution=150)
-        temp.replace(target)
+        return len(PdfReader(str(path)).pages)
+    except Exception:
+        return -1
+
+
+def chapter_pdf(images, target):
+    temporary = target.with_suffix(".pdf.part")
+    try:
+        with temporary.open("wb") as out:
+            img2pdf.convert([str(path) for path in images], outputstream=out)
+        if pdf_pages(temporary) != len(images):
+            raise ValueError("Generated PDF page count does not match image count")
+        temporary.replace(target)
     finally:
-        for image in images:
-            image.close()
+        if temporary.exists():
+            temporary.unlink()
 
 
-def run_item(client, item, root, args, errors):
-    uuid, title = item["uuid"], item["title"]
-    # A previous release could name the folder UUID_UUID when the page title
-    # was absent. Preserve that folder so previously downloaded pages remain
-    # available after discovery learns the Japanese title.
-    old_folders = [p for p in root.iterdir() if p.is_dir() and p.name.endswith("_" + uuid)]
-    if len(old_folders) > 1:
-        raise ValueError(f"Multiple existing folders for {uuid}; resolve duplicates manually")
-    folder = old_folders[0] if old_folders else root / (safe_name(title) + "_" + uuid)
-    folder.mkdir(parents=True, exist_ok=True)
-    manifest_path = folder / "manifest.json"
-    (folder / "manifest_url.txt").write_text(item["manifest_url"] + "\n", encoding="utf-8")
-    metadata_path = root / ("metadata_" + uuid + ".json")
-    try:
-        if not metadata_path.exists():
-            dump(metadata_path, client.json(f"{BASE}/portal/en/assets/{uuid}?_format=json"))
-    except Exception as exc:
-        errors.append({"uuid": uuid, "stage": "metadata", "error": str(exc)})
-    try:
-        if manifest_path.exists():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        else:
-            manifest = client.json(item["manifest_url"])
-            dump(manifest_path, manifest)
-        pages = extract_pages(manifest)
-        if not pages:
-            raise ValueError("Manifest has zero canvases")
-    except Exception as exc:
-        errors.append({"uuid": uuid, "stage": "manifest", "error": str(exc)})
-        return {**item, "status": "manifest_error", "expected_pages": 0, "downloaded_pages": 0, "pdf": False}
-    image_dir = folder / "images"
-    image_dir.mkdir(exist_ok=True)
-    saved = []
-    for index, page in enumerate(pages, 1):
-        prefix = image_dir / f"page_{index:04d}"
-        path = existing_image(prefix)
+def import_old_images(root, chapter, target, total):
+    """Copy, never move/delete, verified pages from an older UUID-suffixed folder."""
+    for old in root.iterdir():
+        if not old.is_dir() or old == target.parent or not old.name.endswith("_" + chapter["uuid"]):
+            continue
+        old_images = old / "images"
+        if not old_images.is_dir():
+            continue
+        for number in range(1, total + 1):
+            if find_image(target, number):
+                continue
+            source = find_image(old_images, number)
+            if source:
+                shutil.copy2(source, target / source.name)
+
+
+def process_chapter(http, root, chapter):
+    directory = root / chapter["folder"]
+    directory.mkdir(parents=True, exist_ok=True)
+    pictures = directory / "images"
+    pictures.mkdir(exist_ok=True)
+    manifest_path = directory / "manifest.json"
+    manifest_url = f"{HOST}/portal/repo/iiif/{chapter['uuid']}/manifest"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    else:
+        manifest = http.json(manifest_url)
+        identifier = manifest.get("id") or manifest.get("@id") or ""
+        if identifier and chapter["uuid"] not in identifier:
+            raise ValueError("Manifest ID does not match expected UUID")
+        write_json(manifest_path, manifest)
+    urls = page_images(manifest)
+    import_old_images(root, chapter, pictures, len(urls))
+    status = {**chapter, "manifest_url": manifest_url, "expected_pages": len(urls),
+              "downloaded_pages": 0, "missing_pages": [], "pdf_complete": False}
+    files = []
+    for number, url in enumerate(urls, 1):
+        path = find_image(pictures, number)
         if path is None:
             try:
-                url = negotiated_image_url(client, page) if args.full_resolution else page.get("url")
-                path = save_image(client, url, prefix)
+                path = get_image(http, url, pictures, number)
+            except PermissionError:
+                raise
             except Exception as exc:
-                errors.append({"uuid": uuid, "stage": "image", "page": index,
-                               "label": page.get("label"), "error": str(exc)})
-        saved.append(path)
-    complete = all(saved)
-    pdf_ok = False
-    if not args.no_pdf and (complete or args.allow_partial_pdf) and any(saved):
-        target = folder / (safe_name(title) + ("_PARTIAL" if not complete else "") + ".pdf")
-        try:
-            if not target.exists() or args.rebuild_pdf:
-                create_pdf([p for p in saved if p], target)
-            pdf_ok = True
-        except Exception as exc:
-            errors.append({"uuid": uuid, "stage": "pdf", "error": str(exc)})
-    result = {**item, "status": "complete" if complete else "incomplete", "expected_pages": len(pages),
-              "downloaded_pages": sum(bool(p) for p in saved), "pdf": pdf_ok,
-              "missing_pages": [i for i, p in enumerate(saved, 1) if not p]}
-    dump(folder / "status.json", result)
-    return result
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("UTokyo_Genji_Archive"))
-    parser.add_argument("--max-items", type=int, default=0, help="0 = all discovered items (only a preview in collection mode)")
-    parser.add_argument("--max-pages", type=int, default=100)
-    parser.add_argument("--delay", type=float, default=0.5)
-    parser.add_argument("--timeout", type=int, default=25)
-    parser.add_argument("--retries", type=int, default=2)
-    parser.add_argument("--test-uuid", action="store_true", help="Verify and process only the Kiritsubo test asset")
-    parser.add_argument("--source", choices=("collection", "api"), default="collection",
-                        help="collection = directly linked preview items (default); api = full search, if permitted")
-    parser.add_argument("--collection-html", type=Path,
-                        help="Use a browser-saved HTML source of the Genji collection page instead of fetching it")
-    parser.add_argument("--collection-preview", action="store_true",
-                        help="Deprecated alias for default --source collection")
-    parser.add_argument("--discover-only", action="store_true")
-    parser.add_argument("--no-pdf", action="store_true")
-    parser.add_argument("--allow-partial-pdf", action="store_true")
-    parser.add_argument("--rebuild-pdf", action="store_true")
-    parser.add_argument("--full-resolution", action="store_true", help="Negotiate IIIF Image API size via info.json")
-    args = parser.parse_args(argv)
-    if args.delay < 0.3 or args.max_items < 0 or args.max_pages < 1 or args.retries < 0:
-        parser.error("Use --delay >= 0.3, nonnegative max-items/retries and positive max-pages")
-    if args.collection_html and args.source == "api":
-        parser.error("--collection-html cannot be combined with --source api")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    root = args.output
-    root.mkdir(parents=True, exist_ok=True)
-    client = Client(args.delay, args.timeout, args.retries)
-    errors = []
-    records = []
-    try:
-        if args.test_uuid:
-            ids, reports = [TEST_UUID], [{"mode": "test-uuid", "uuids": [TEST_UUID]}]
-        elif args.source == "api" and not args.collection_preview:
-            ids, reports = search_discovery(client, args.max_pages)
+                LOG.error("%02d %s: image %d failed: %s", chapter["number"], chapter["title"], number, exc)
+        if path:
+            files.append(path)
         else:
-            ids, reports = preview_discovery(client, root, args.collection_html)
-        # Bound the detail-page verification requests during small test runs.
-        verified = []
-        candidates = ids[:args.max_items] if args.max_items else ids
-        for uuid in candidates:
-            try:
-                item = verify_asset(client, uuid)
-                preview_titles = reports[0].get("titles", {})
-                if item["title"] == uuid and preview_titles.get(uuid):
-                    item["title"] = preview_titles[uuid]
-                verified.append(item)
-            except Exception as exc:
-                errors.append({"uuid": uuid, "stage": "membership", "error": str(exc)})
-        is_api = args.source == "api" and not (args.collection_preview or args.test_uuid)
-        dump(root / "discovery.json", {"source": SEARCH if is_api else COLLECTION,
-                                       "filter": "collection=genji", "exhaustive": is_api,
-                                       "candidate_count": len(ids), "verified_count": len(verified),
-                                       "pages": reports, "assets": verified})
-        if not verified:
-            raise RuntimeError("No verified Genji assets; no images will be downloaded")
-        if not args.discover_only:
-            for pos, item in enumerate(verified, 1):
-                LOG.info("Asset %s/%s: %s [%s]", pos, len(verified), item["title"], item["uuid"])
-                records.append(run_item(client, item, root, args, errors))
-                dump(root / "errors.json", errors)
-                dump(root / "summary.json", summary(ids, verified, records))
-    except (KeyboardInterrupt, Exception) as exc:
-        errors.append({"stage": "run", "error": str(exc)})
-        LOG.error("Stopped: %s", exc)
-        dump(root / "errors.json", errors)
-        dump(root / "summary.json", summary(locals().get("ids", []), locals().get("verified", []), records))
-        return 130 if isinstance(exc, KeyboardInterrupt) else 1
-    dump(root / "errors.json", errors)
-    dump(root / "summary.json", summary(ids, verified, records))
-    LOG.info("Finished: %d items, %d errors", len(records), len(errors))
-    return 0 if not errors else 2
+            status["missing_pages"].append(number)
+        status["downloaded_pages"] = len(files)
+        write_json(directory / "status.json", status)
+    if len(files) == len(urls):
+        target = directory / f"{chapter['folder']}.pdf"
+        if pdf_pages(target) != len(urls):
+            chapter_pdf(files, target)
+        status["pdf_complete"] = pdf_pages(target) == len(urls)
+    write_json(directory / "status.json", status)
+    # Metadata are useful but can be unavailable even when images are public.
+    meta_path = directory / "metadata.json"
+    if not meta_path.exists():
+        try:
+            metadata = http.json(f"{HOST}/portal/en/assets/{chapter['uuid']}?_format=json")
+            write_json(meta_path, metadata)
+        except Exception as exc:
+            LOG.warning("Metadata for %s unavailable: %s", chapter["title"], exc)
+    return status
 
 
-def summary(ids, verified, records):
-    return {"found_candidates": len(ids), "verified_assets": len(verified),
-            "processed_assets": len(records), "expected_pages": sum(x["expected_pages"] for x in records),
-            "downloaded_pages": sum(x["downloaded_pages"] for x in records),
-            "pdfs": sum(bool(x["pdf"]) for x in records),
-            "complete_assets": sum(x["status"] == "complete" for x in records), "assets": records}
+def merge_master(root, index, statuses):
+    if len(index) != 54 or sorted(c["number"] for c in index) != list(range(1, 55)):
+        LOG.info("No master PDF: the HTML does not contain all 54 chapters")
+        return False
+    if len(statuses) != 54 or any(not s.get("pdf_complete") for s in statuses):
+        LOG.info("No master PDF: at least one chapter or page is missing")
+        return False
+    for chapter, status in zip(index, statuses):
+        if (status.get("uuid") != chapter["uuid"] or status.get("number") != chapter["number"]
+                or status.get("expected_pages", 0) < 1
+                or status.get("downloaded_pages") != status["expected_pages"]):
+            LOG.error("No master PDF: chapter identity/page count mismatch for %s", chapter["title"])
+            return False
+        folder = root / chapter["folder"] / "images"
+        if any(find_image(folder, i) is None for i in range(1, status["expected_pages"] + 1)):
+            LOG.error("No master PDF: missing or corrupt image in %s", chapter["title"])
+            return False
+    parts = [root / chapter["folder"] / f"{chapter['folder']}.pdf" for chapter in index]
+    count = sum(s["expected_pages"] for s in statuses)
+    if any(pdf_pages(path) != status["expected_pages"] for path, status in zip(parts, statuses)):
+        LOG.error("No master PDF: a chapter PDF failed its page-count check")
+        return False
+    target = root / "Genji_Monogatari_Gesamt.pdf"
+    if pdf_pages(target) == count:
+        LOG.info("Master PDF already complete: %s", target)
+        return True
+    size = sum(path.stat().st_size for path in parts)
+    if shutil.disk_usage(root).free < size * 1.2:
+        LOG.error("Not enough free disk space for master PDF (about %.1f GB needed)", size * 1.2 / 1e9)
+        return False
+    temporary = root / "Genji_Monogatari_Gesamt.pdf.part"
+    writer = PdfWriter()
+    try:
+        for path in parts:
+            LOG.info("Master PDF: adding %s", path.name)
+            writer.append(str(path))
+        with temporary.open("wb") as stream:
+            writer.write(stream)
+        if pdf_pages(temporary) != count:
+            raise ValueError("Master PDF page count differs from total of chapter PDFs")
+        temporary.replace(target)
+        return True
+    finally:
+        writer.close()
+        if temporary.exists():
+            temporary.unlink()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--html", type=Path, default=Path("genji.html"))
+    parser.add_argument("--output", type=Path, default=Path("UTokyo_Genji_Archive"))
+    parser.add_argument("--max-chapters", type=int, default=0, help="0 = all records from saved HTML")
+    parser.add_argument("--delay", type=float, default=0.5)
+    parser.add_argument("--timeout", type=float, default=30)
+    parser.add_argument("--no-master", action="store_true")
+    parser.add_argument("--list-only", action="store_true", help="Check the HTML and show all chapters, no downloads")
+    args = parser.parse_args()
+    if args.delay < 0.3 or args.max_chapters < 0:
+        parser.error("Use --delay >= 0.3 and --max-chapters >= 0")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if not args.html.is_file():
+        parser.error(f"HTML file not found: {args.html}")
+    index = parse_html(args.html)
+    LOG.info("Saved HTML contains %d distinct Genji chapters", len(index))
+    for chapter in index:
+        LOG.info("%02d %s", chapter["number"], chapter["title"])
+    if args.list_only:
+        return 0
+    args.output.mkdir(parents=True, exist_ok=True)
+    write_json(args.output / "index.json", {"html_source": str(args.html),
+                                             "found_chapters": len(index), "chapters": index})
+    chosen = index[:args.max_chapters] if args.max_chapters else index
+    http = Http(args.delay, args.timeout, 2)
+    statuses, errors = [], []
+    for chapter in chosen:
+        LOG.info("Downloading %02d %s", chapter["number"], chapter["title"])
+        try:
+            statuses.append(process_chapter(http, args.output, chapter))
+        except Exception as exc:
+            LOG.error("Chapter %02d stopped: %s", chapter["number"], exc)
+            errors.append({"chapter": chapter, "error": str(exc)})
+            if isinstance(exc, PermissionError):
+                LOG.error("HTTP 403/429: stopping requests; try again when access is available")
+                break
+        write_json(args.output / "errors.json", errors)
+        write_json(args.output / "summary.json", {"found_chapters": len(index),
+                   "processed_chapters": len(statuses), "chapters": statuses,
+                   "images_downloaded": sum(x["downloaded_pages"] for x in statuses),
+                   "expected_images": sum(x["expected_pages"] for x in statuses),
+                   "complete_pdfs": sum(x["pdf_complete"] for x in statuses)})
+    # Re-read existing statuses: a short test run can still recognize an already
+    # completed 54-chapter archive without downloading anything twice.
+    completed = []
+    for chapter in index:
+        path = args.output / chapter["folder"] / "status.json"
+        if path.is_file():
+            completed.append(json.loads(path.read_text(encoding="utf-8")))
+    master = False
+    if not args.no_master and not errors:
+        master = merge_master(args.output, index, completed)
+    write_json(args.output / "errors.json", errors)
+    write_json(args.output / "summary.json", {"found_chapters": len(index),
+               "processed_this_run": len(statuses), "complete_chapters": sum(s.get("pdf_complete", False) for s in completed),
+               "expected_images": sum(s["expected_pages"] for s in completed),
+               "downloaded_images": sum(s["downloaded_pages"] for s in completed),
+               "master_pdf_complete": master, "errors": errors})
+    return 0 if not errors else 1
 
 
 if __name__ == "__main__":
