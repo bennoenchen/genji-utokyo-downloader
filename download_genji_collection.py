@@ -22,6 +22,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 BASE = "https://da.dl.itc.u-tokyo.ac.jp"
 SEARCH = BASE + "/portal/search"
+COLLECTION = BASE + "/portal/en/collection/genji"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 ASSET_RE = re.compile(r"/portal/(?:en/)?assets/([0-9a-f-]{36})(?:[/?#]|$)", re.I)
 TEST_UUID = "c1ea8e6b-9403-4394-8619-96aad0ec6329"
@@ -148,6 +149,28 @@ def search_discovery(client, max_pages, page_size=20):
     if not found:
         raise RuntimeError("Search API returned no recognizable asset URLs; inspect its JSON before changing extraction")
     return found, reports
+
+
+def preview_discovery(client):
+    """Read only asset links on the Genji collection landing page (not its search page).
+
+    This page advertises a small preview, not the complete inventory. Never
+    interpret these results as an exhaustive collection download.
+    """
+    with client.get(COLLECTION) as response:
+        soup = BeautifulSoup(response.text, "html.parser")
+    ids = []
+    for link in soup.find_all("a", href=True):
+        url = urljoin(COLLECTION, link["href"])
+        if urlparse(url).netloc != urlparse(BASE).netloc:
+            continue
+        match = ASSET_RE.search(urlparse(url).path)
+        if match and match.group(1).lower() not in ids:
+            ids.append(match.group(1).lower())
+    if not ids:
+        raise RuntimeError("No Genji preview asset links found on collection landing page")
+    return ids, [{"mode": "collection-preview-only", "source": COLLECTION,
+                  "uuids": ids, "exhaustive": False}]
 
 
 def verify_asset(client, uuid):
@@ -379,6 +402,8 @@ def main(argv=None):
     parser.add_argument("--timeout", type=int, default=25)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--test-uuid", action="store_true", help="Verify and process only the Kiritsubo test asset")
+    parser.add_argument("--collection-preview", action="store_true",
+                        help="Use only visible Genji landing-page asset links; NOT a complete collection")
     parser.add_argument("--discover-only", action="store_true")
     parser.add_argument("--no-pdf", action="store_true")
     parser.add_argument("--allow-partial-pdf", action="store_true")
@@ -396,6 +421,8 @@ def main(argv=None):
     try:
         if args.test_uuid:
             ids, reports = [TEST_UUID], [{"mode": "test-uuid", "uuids": [TEST_UUID]}]
+        elif args.collection_preview:
+            ids, reports = preview_discovery(client)
         else:
             ids, reports = search_discovery(client, args.max_pages)
         # Bound the detail-page verification requests during small test runs.
@@ -407,7 +434,8 @@ def main(argv=None):
                 verified.append(item)
             except Exception as exc:
                 errors.append({"uuid": uuid, "stage": "membership", "error": str(exc)})
-        dump(root / "discovery.json", {"source": SEARCH, "filter": "collection=genji",
+        dump(root / "discovery.json", {"source": COLLECTION if args.collection_preview else SEARCH,
+                                       "filter": "collection=genji", "exhaustive": not (args.collection_preview or args.test_uuid),
                                        "candidate_count": len(ids), "verified_count": len(verified),
                                        "pages": reports, "assets": verified})
         if not verified:
