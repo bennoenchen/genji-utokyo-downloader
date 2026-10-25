@@ -1,128 +1,87 @@
-# Genji Monogatari Downloader
+# UTokyo Digital Archive Downloader
 
-Lädt die digitalisierten historischen Handschriften des Genji Monogatari (源氏物語) aus dem Digitalarchiv der Universität Tokio herunter und erstellt daraus eine vollständige lokale Sammlung.
+Dieses Kommandozeilenwerkzeug archiviert Bildmaterial aus gespeicherten Suchergebnissen des Digitalarchivs der Universität Tokio. Es liest UTokyo-Asset-Einträge aus einer HTML-Datei, lädt die Bilder aus den jeweiligen IIIF-Manifests und erzeugt für vollständige Bildsätze einzelne PDFs. Eine Gesamt-PDF wird ausschließlich mit `--master-pdf` erstellt.
 
-Die finale Version verwendet eine lokal gespeicherte `genji.html`, die alle 54 Kapitel der Sammlung enthält. Dadurch entfällt die fehleranfällige Online-Erkennung früherer Versionen und der Download erfolgt reproduzierbar.
+## Voraussetzungen und Installation
 
-## Funktionen
+Python 3.10 oder neuer sowie Netzwerkzugriff zum UTokyo Digital Archive.
 
-- Download aller 54 Kapitel
-- Nutzung der offiziellen UTokyo-Asset-UUIDs
-- Speicherung der Metadaten (`manifest.json`)
-- Download der hochauflösenden Manuskriptbilder
-- Automatische Erstellung einer PDF pro Kapitel
-- Optionale Gesamt-PDF aller Kapitel
-- Wiederaufnahme unterbrochener Downloads
-- Überspringen bereits vorhandener Dateien
-- Fortschrittsanzeige während des Downloads
+Windows (PowerShell):
 
-## Projektstruktur
-
-```
-genji-downloader-54/
-├── genji_download.py
-├── genji.html
-├── test_genji_download.py
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
-
-## Voraussetzungen
-
-- Python 3.10 oder neuer
-- Windows, Linux oder macOS
-- Internetverbindung
-
-## Installation
-
-### Windows
-
-```
+```powershell
 py -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-### Linux / macOS
+Linux/macOS:
 
-```
+```sh
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-## Verwendung
+## Eingabe vorbereiten
 
-### Download aller Kapitel
+Suche im UTokyo Digital Archive nach den gewünschten Objekten und speichere die Suchergebnisseite im Browser als HTML-Datei. Übergib sie mit `--html`. Die aktuelle Implementierung erkennt Asset-Einträge mit UUID unter `/portal/assets/` und IIIF Presentation API 2- oder 3-Manifeste mit Bildressourcen. Das deckt nicht automatisch alle UTokyo-Websites, Inhalte oder Dateitypen ab.
 
-```
-python download_genji_collection.py
-```
+## Beispiele
 
-### Tests ausführen
+HTML prüfen und Assets anzeigen, ohne etwas herunterzuladen:
 
-```
-python test.py
+```sh
+python utokyo_archive_downloader.py --html suche.html --list-only
 ```
 
-## Ausgabe
+Alle gefundenen Assets herunterladen:
 
-Nach erfolgreichem Download entsteht beispielsweise folgende Struktur:
-
-```
-output/
-├── chapter_01_桐壺/
-│   ├── manifest.json
-│   ├── page_0001.jpg
-│   ├── page_0002.jpg
-│   └── chapter.pdf
-├── chapter_02_帚木/
-│   └── ...
-├── ...
-└── Genji_Monogatari_Complete.pdf
+```sh
+python utokyo_archive_downloader.py --html suche.html --output UTokyo_Archive
 ```
 
-## Abhängigkeiten
+Erst zwei Assets als Probelauf laden:
 
-`requirements.txt`
-
-```
-requests
-beautifulsoup4
-Pillow
-img2pdf
+```sh
+python utokyo_archive_downloader.py --html suche.html --max-assets 2
 ```
 
-## Bekannte Einschränkungen
+Gesamt-PDF ausdrücklich anfordern:
 
-- Das Projekt hängt von der Verfügbarkeit des UTokyo-Digitalarchivs ab.
-- Änderungen an der IIIF-API oder den Asset-URLs können Anpassungen erforderlich machen.
-- Einzelne Kapitel können serverseitig zeitweise nicht erreichbar sein; vorhandene Dateien werden bei einem erneuten Lauf nicht erneut heruntergeladen.
+```sh
+python utokyo_archive_downloader.py --html suche.html --output UTokyo_Archive --master-pdf UTokyo_Archive/Sammlung.pdf
+```
 
-## Entwicklung mit KI
+Alle Optionen und Standardwerte:
 
-Dieses Projekt entstand iterativ mit Unterstützung einer KI und wurde über mehrere Versionen weiterentwickelt.
+```sh
+python utokyo_archive_downloader.py --help
+```
 
-### Bewährter Workflow
+## Ausgabe und Wiederaufnahme
 
-1. Kleine Änderungen einzeln umsetzen.
-2. Neue Funktionen zunächst an einem Kapitel testen.
-3. Anschließend den vollständigen Lauf über alle 54 Kapitel prüfen.
-4. Bei Änderungen an der Archivstruktur zuerst `genji.html` und die IIIF-Manifeste überprüfen.
+Die Ausgabe enthält für jedes Asset einen Ordner mit `manifest.json`, `status.json`, `images/` und (sofern alle Seiten vorhanden sind) einer PDF. Katalogmetadaten werden nach Möglichkeit als `metadata.json` gespeichert. Im Hauptordner liegen `index.json`, `summary.json` und `errors.json`.
 
-### Nützlicher Prompt für Weiterentwicklungen
+Ein erneuter Lauf prüft das aktuelle Manifest und setzt fehlende oder beschädigte Bildseiten fort. Erkennt das Programm ein geändertes Manifest, bewahrt es alte Bilder und PDFs in separat benannten Dateien auf und lädt die neuen Bildseiten erneut. Die Gesamt-PDF wird nur erstellt, wenn alle im HTML gefundenen Assets vollständig sind. Bei `--max-assets` wird sie übersprungen.
 
-> Erweitere den bestehenden `download_genji_collection.py`, ohne die bestehende Downloadlogik zu verändern. Nutze weiterhin `genji.html` als Quelle für die 54 Kapitel, achte auf Kompatibilität mit der IIIF Presentation API und erhalte die Wiederaufnahme bereits heruntergeladener Dateien.
+## Genji-Beispiel
 
-## Datenquelle
+Die mitgelieferte `genji.html` enthält 54 Kapitel des Genji Monogatari. Optional kann `--genji` verwendet werden, um Kapitelnamen zu validieren und die bekannte Kapitelreihenfolge anzuwenden:
 
-Digital Archive der Universität Tokio (UTokyo).
+```sh
+python utokyo_archive_downloader.py --html genji.html --genji --output UTokyo_Genji_Archive --master-pdf UTokyo_Genji_Archive/Genji.pdf
+```
 
-Die Manuskriptbilder stammen aus den öffentlich zugänglichen Digitalisaten der Genji-Monogatari-Sammlung der Universität Tokio. Bitte beachte die jeweiligen Nutzungsbedingungen des Archivs für Weiterverwendung oder Veröffentlichung der heruntergeladenen Bilder.
+## Grenzen und Nutzungsbedingungen
 
-## Lizenz
+- Der Download hängt von der Verfügbarkeit und den Zugriffsregeln des UTokyo Digital Archive ab.
+- Andere UTokyo-Bereiche können abweichende Seitenformate oder IIIF-Varianten nutzen.
+- Beachte vor Weiterverwendung oder Veröffentlichung die Rechteangaben und Nutzungsbedingungen des jeweiligen Objekts.
 
-Dieses Repository enthält ausschließlich den Downloader und Hilfsdateien.
+## Entwicklung
 
-Die heruntergeladenen Digitalisate stammen von der Universität Tokio und unterliegen den dort angegebenen Nutzungsbedingungen.
+Offline-Tests ausführen:
+
+```sh
+python -m unittest -v test.py
+```

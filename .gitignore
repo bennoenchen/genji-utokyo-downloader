@@ -1,4 +1,6 @@
 .venv/
 __pycache__/
 *.py[cod]
-UTokyo_Genji_Archive/
+UTokyo_Archive/
+.test-tmp/
+_trial_run/
