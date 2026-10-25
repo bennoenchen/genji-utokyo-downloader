@@ -1,13 +1,15 @@
 # Genji Collection Downloader
-- `--collection-preview` liest Asset-Links, die direkt auf der Genji-Landingpage aufgeführt sind.
-- Ohne diese Option wird der Suchendpunkt mit `collection=genji` verwendet.
-- Gefundene UUIDs werden anhand ihrer Archiv-Detailseite geprüft, bevor Bilder abgerufen werden.
-- Die Vorschau ist **kein vollständiger Katalog**: Sie enthält nur die Einträge, die die Landingpage verlinkt.
+
+- Standard ist `--source collection`: Es werden direkt auf der Genji-Landingpage verlinkte Einträge verarbeitet. Das ist nur eine Vorschau, kein vollständiger Katalog.
+- `--source api` versucht die breitere Suche am Archiv-Suchendpunkt.
+- `--collection-html PFAD` liest eine lokale HTML-Datei statt die Sammlungsseite live abzurufen.
+- Eine erfolgreich geladene Live-Sammlungsseite wird im Ausgabeordner als `collection_genji.html` gespeichert. Falls ein späterer Live-Abruf scheitert, wird dieser Cache verwendet, sofern vorhanden.
+- Ein vorhandener Eintragsordner mit derselben UUID wird bevorzugt weiterverwendet, damit bereits gespeicherte Bilder nicht wegen eines geänderten oder fehlenden Titels verloren gehen.
 
 ## Voraussetzungen
 
 - Python 3.10 oder neuer
-- Internetzugang zum Digital Archive der Universität Tokio
+- Internetzugang für Live-Abrufe; bei einer passenden lokalen HTML-Datei ist dieser für die Erkennung nicht zwingend erforderlich
 - Pakete aus `requirements.txt`: `requests`, `beautifulsoup4` und `Pillow`
 
 ## Installation unter Windows / PowerShell
@@ -23,59 +25,70 @@ py -m venv .venv
 Optionen anzeigen:
 
 ```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-5.py --help
+.\.venv\Scripts\python.exe .\download_genji_collection-6.py --help
 ```
 
-Nur die Sammlungs-Vorschau erkennen und verifizieren, ohne Bilder herunterzuladen:
+Standardmodus nur zur Erkennung und Prüfung verwenden:
 
 ```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-5.py --collection-preview --discover-only
+.\.venv\Scripts\python.exe .\download_genji_collection-6.py --source collection --discover-only
 ```
 
-Suchmodus ohne Bilddownload prüfen:
+Eine lokal gespeicherte HTML-Datei verwenden:
 
 ```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-5.py --discover-only
+.\.venv\Scripts\python.exe .\download_genji_collection-6.py --collection-html .\genji-collection.html --discover-only
 ```
 
-Mit der im Skript hinterlegten Test-UUID testen:
+Die HTML-Datei muss die Asset-Links der Genji-Sammlungsseite enthalten. Eine beliebige Suchergebnisseite ist nicht automatisch geeignet.
+
+Die breitere Suche ausdrücklich aktivieren:
 
 ```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-5.py --test-uuid
+.\.venv\Scripts\python.exe .\download_genji_collection-6.py --source api --discover-only
 ```
 
-Höchstens zwei gefundene Einträge verarbeiten:
+Mit der eingebauten Test-UUID testen:
 
 ```powershell
-.\.venv\Scripts\python.exe .\download_genji_collection-5.py --max-items 2
+.\.venv\Scripts\python.exe .\download_genji_collection-6.py --test-uuid
+```
+
+Höchstens zwei Einträge verarbeiten:
+
+```powershell
+.\.venv\Scripts\python.exe .\download_genji_collection-6.py --max-items 2
 ```
 
 ## Wichtige Optionen
 
 | Option | Bedeutung |
 |---|---|
-| `--collection-preview` | Direkt auf der Genji-Landingpage verlinkte Einträge verwenden; unvollständig |
+| `--source collection` | Standard: direkt verlinkte Einträge der Genji-Landingpage |
+| `--source api` | Versucht den breiteren Suchmodus; kann durch Serverbeschränkungen scheitern |
+| `--collection-html PFAD` | Lokale HTML-Datei verwenden; nicht mit `--source api` kombinieren |
+| `--collection-preview` | Veralteter Alias für den Collection-Modus |
 | `--test-uuid` | Nur die im Skript hinterlegte Test-UUID verwenden |
-| `--discover-only` | Kandidaten suchen und prüfen, ohne Bilder herunterzuladen |
+| `--discover-only` | Einträge suchen und prüfen, ohne Bilder herunterzuladen |
 | `--output PFAD` | Ausgabeordner; Standard: `UTokyo_Genji_Archive` |
-| `--max-items N` | Höchstens N verifizierte Einträge verarbeiten |
-| `--max-pages N` | Maximale Suchseitenanzahl; Standard: `100` |
+| `--max-items N` | Höchstens N Einträge verarbeiten |
+| `--max-pages N` | Maximale Suchseitenzahl im API-Modus; Standard: `100` |
 | `--delay SEKUNDEN` | Pause zwischen Anfragen; mindestens `0.3`, Standard: `0.5` |
 | `--timeout SEKUNDEN` | HTTP-Zeitlimit; Standard: `25` |
 | `--retries N` | Wiederholungsversuche; Standard: `2` |
 | `--no-pdf` | PDF-Erstellung ausschalten |
-| `--allow-partial-pdf` | PDF auch bei fehlenden Seiten erzeugen |
+| `--allow-partial-pdf` | PDF trotz fehlender Seiten erzeugen |
 | `--rebuild-pdf` | Bestehende PDFs neu erzeugen |
-| `--full-resolution` | Versucht, die verfügbare Bildgröße über IIIF `info.json` auszuhandeln |
+| `--full-resolution` | Versucht, verfügbare Bildgröße über IIIF `info.json` auszuhandeln |
 
-Nutze `--help` für die vollständige Liste und die Standardwerte.
+Die vollständige Optionsliste steht in `--help`.
 
 ## Ausgaben und Fehlerprüfung
 
-Standardmäßig schreibt das Programm nach `UTokyo_Genji_Archive`. Dazu gehören Discovery-, Status-, Fehler- und Zusammenfassungsdateien, Metadaten, IIIF-Manifeste, Bilder und gegebenenfalls PDFs. Prüfe `discovery.json`, `summary.json`, `errors.json` und die Statusdateien. Eine PDF kann unvollständig sein, wenn Seiten nicht geladen wurden.
+Standardmäßig liegen die Ergebnisse in `UTokyo_Genji_Archive`. Dort können `collection_genji.html`, `discovery.json`, `summary.json`, `errors.json`, Metadaten, IIIF-Manifeste, Bilder, Statusdateien und PDFs entstehen. Prüfe die Status- und Fehlerdateien, bevor du PDFs als vollständig behandelst.
 
-Die Vorschau kann nicht garantieren, dass alle Kapitel enthalten sind. Bei `403`, `429` oder Verbindungsabbrüchen die Anfragen reduzieren, `--discover-only` verwenden und später erneut versuchen.
+Der lokale HTML-Cache hilft bei vorübergehenden Problemen, ersetzt aber keine vollständige Katalogsuche. Bei `403`, `429` oder Verbindungsabbrüchen zuerst den Erkennungsmodus verwenden, die Anfragen verlangsamen und später erneut versuchen.
 
 ## Nutzung von KI zur Weiterentwicklung
 
-Eine KI kann beim Erklären des Codes, beim Schreiben von Tests und bei der Fehlersuche helfen. Teile konkrete Logs, den exakten Startbefehl und die Python-Version. Bitte die KI, nicht bestätigte Endpunkte oder Archivfunktionen nicht zu erfinden, Änderungen klein zu halten und Tests mitzuliefern. Kontrolliere den Patch mit `git diff` und teste zunächst mit `--discover-only` und `--max-items 1`, bevor du einen größeren Download startest.
+Gib einer KI die genaue Fehlermeldung, den Startbefehl, die Python-Version und relevante Statusdateien. Bitte sie, zuerst die Ursache zu erklären und dann einen kleinen, testbaren Patch vorzuschlagen. API-Endpunkte, UUID-Titel-Zuordnungen und erfolgreiche Downloads dürfen nicht geraten werden. Teste Änderungen zunächst mit einer gespeicherten HTML-Datei oder `--discover-only`, prüfe den Code mit `git diff` und lade erst danach einzelne Einträge herunter.

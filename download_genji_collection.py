@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Conservative, resumable downloader for UTokyo's Genji manuscript collection.
 
-No recursive crawling.  The only discovery source is the documented OpenSearch
-endpoint with collection=genji; downloaded candidates are independently checked
-against their archive detail page before any image requests.
+The default discovers the four-or-so visible items on the collection's landing
+page. A separate opt-in API mode attempts exhaustive discovery. Both modes
+independently verify collection membership before requesting images.
 """
 import argparse
 import io
@@ -151,26 +151,44 @@ def search_discovery(client, max_pages, page_size=20):
     return found, reports
 
 
-def preview_discovery(client):
+def preview_discovery(client, root, html_file=None):
     """Read only asset links on the Genji collection landing page (not its search page).
 
     This page advertises a small preview, not the complete inventory. Never
     interpret these results as an exhaustive collection download.
     """
-    with client.get(COLLECTION) as response:
-        soup = BeautifulSoup(response.text, "html.parser")
+    cache = root / "collection_genji.html"
+    source = COLLECTION
+    if html_file:
+        markup = html_file.read_text(encoding="utf-8-sig")
+        source = str(html_file)
+    else:
+        try:
+            with client.get(COLLECTION) as response:
+                markup = response.text
+            cache.write_text(markup, encoding="utf-8")
+        except Exception as exc:
+            if not cache.is_file():
+                raise
+            LOG.warning("Collection page unavailable (%s); using saved HTML from previous successful run: %s", exc, cache)
+            markup = cache.read_text(encoding="utf-8")
+            source = str(cache)
+    soup = BeautifulSoup(markup, "html.parser")
     ids = []
+    titles = {}
     for link in soup.find_all("a", href=True):
         url = urljoin(COLLECTION, link["href"])
         if urlparse(url).netloc != urlparse(BASE).netloc:
             continue
         match = ASSET_RE.search(urlparse(url).path)
         if match and match.group(1).lower() not in ids:
-            ids.append(match.group(1).lower())
+            uuid = match.group(1).lower()
+            ids.append(uuid)
+            titles[uuid] = link.get_text(" ", strip=True)
     if not ids:
         raise RuntimeError("No Genji preview asset links found on collection landing page")
-    return ids, [{"mode": "collection-preview-only", "source": COLLECTION,
-                  "uuids": ids, "exhaustive": False}]
+    return ids, [{"mode": "collection-preview-only", "source": source,
+                  "uuids": ids, "titles": titles, "exhaustive": False}]
 
 
 def verify_asset(client, uuid):
@@ -340,7 +358,13 @@ def create_pdf(paths, target):
 
 def run_item(client, item, root, args, errors):
     uuid, title = item["uuid"], item["title"]
-    folder = root / (safe_name(title) + "_" + uuid)
+    # A previous release could name the folder UUID_UUID when the page title
+    # was absent. Preserve that folder so previously downloaded pages remain
+    # available after discovery learns the Japanese title.
+    old_folders = [p for p in root.iterdir() if p.is_dir() and p.name.endswith("_" + uuid)]
+    if len(old_folders) > 1:
+        raise ValueError(f"Multiple existing folders for {uuid}; resolve duplicates manually")
+    folder = old_folders[0] if old_folders else root / (safe_name(title) + "_" + uuid)
     folder.mkdir(parents=True, exist_ok=True)
     manifest_path = folder / "manifest.json"
     (folder / "manifest_url.txt").write_text(item["manifest_url"] + "\n", encoding="utf-8")
@@ -396,14 +420,18 @@ def run_item(client, item, root, args, errors):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("UTokyo_Genji_Archive"))
-    parser.add_argument("--max-items", type=int, default=0, help="0 = all verified search results")
+    parser.add_argument("--max-items", type=int, default=0, help="0 = all discovered items (only a preview in collection mode)")
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--delay", type=float, default=0.5)
     parser.add_argument("--timeout", type=int, default=25)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--test-uuid", action="store_true", help="Verify and process only the Kiritsubo test asset")
+    parser.add_argument("--source", choices=("collection", "api"), default="collection",
+                        help="collection = directly linked preview items (default); api = full search, if permitted")
+    parser.add_argument("--collection-html", type=Path,
+                        help="Use a browser-saved HTML source of the Genji collection page instead of fetching it")
     parser.add_argument("--collection-preview", action="store_true",
-                        help="Use only visible Genji landing-page asset links; NOT a complete collection")
+                        help="Deprecated alias for default --source collection")
     parser.add_argument("--discover-only", action="store_true")
     parser.add_argument("--no-pdf", action="store_true")
     parser.add_argument("--allow-partial-pdf", action="store_true")
@@ -412,6 +440,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.delay < 0.3 or args.max_items < 0 or args.max_pages < 1 or args.retries < 0:
         parser.error("Use --delay >= 0.3, nonnegative max-items/retries and positive max-pages")
+    if args.collection_html and args.source == "api":
+        parser.error("--collection-html cannot be combined with --source api")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     root = args.output
     root.mkdir(parents=True, exist_ok=True)
@@ -421,21 +451,25 @@ def main(argv=None):
     try:
         if args.test_uuid:
             ids, reports = [TEST_UUID], [{"mode": "test-uuid", "uuids": [TEST_UUID]}]
-        elif args.collection_preview:
-            ids, reports = preview_discovery(client)
-        else:
+        elif args.source == "api" and not args.collection_preview:
             ids, reports = search_discovery(client, args.max_pages)
+        else:
+            ids, reports = preview_discovery(client, root, args.collection_html)
         # Bound the detail-page verification requests during small test runs.
         verified = []
         candidates = ids[:args.max_items] if args.max_items else ids
         for uuid in candidates:
             try:
                 item = verify_asset(client, uuid)
+                preview_titles = reports[0].get("titles", {})
+                if item["title"] == uuid and preview_titles.get(uuid):
+                    item["title"] = preview_titles[uuid]
                 verified.append(item)
             except Exception as exc:
                 errors.append({"uuid": uuid, "stage": "membership", "error": str(exc)})
-        dump(root / "discovery.json", {"source": COLLECTION if args.collection_preview else SEARCH,
-                                       "filter": "collection=genji", "exhaustive": not (args.collection_preview or args.test_uuid),
+        is_api = args.source == "api" and not (args.collection_preview or args.test_uuid)
+        dump(root / "discovery.json", {"source": SEARCH if is_api else COLLECTION,
+                                       "filter": "collection=genji", "exhaustive": is_api,
                                        "candidate_count": len(ids), "verified_count": len(verified),
                                        "pages": reports, "assets": verified})
         if not verified:
