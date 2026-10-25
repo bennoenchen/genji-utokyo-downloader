@@ -275,9 +275,16 @@ def process_asset(http, root, asset):
         else:
             status["missing_pages"].append(number)
         status["downloaded_pages"] = len(files)
-        LOG.info("%02d %s: page %d/%d (%d complete, %d missing)", asset["number"],
-                 asset["title"], number, len(urls), len(files), len(status["missing_pages"]))
+        width = 24
+        filled = width * number // len(urls)
+        bar = "#" * filled + "-" * (width - filled)
+        progress = (f"\r{asset['number']:02d} {asset['title']}: [{bar}] "
+                    f"{number}/{len(urls)} pages ({len(files)} complete, "
+                    f"{len(status['missing_pages'])} missing)")
+        sys.stderr.write(progress)
+        sys.stderr.flush()
         write_json(directory / "status.json", status)
+    sys.stderr.write("\n")
     if len(files) == len(urls):
         target = directory / f"{asset['folder']}.pdf"
         if pdf_pages(target) != len(urls):

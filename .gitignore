@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 UTokyo_Archive/
 *.html
+test_files/
