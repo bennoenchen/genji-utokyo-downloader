@@ -32,18 +32,34 @@ ORDINAL = {name: index for index, name in enumerate(GENJI_CHAPTERS, 1)}
 LOG = logging.getLogger("utokyo_archive")
 
 
+class RemoteAccessDenied(Exception):
+    """The archive rejected a request with HTTP 403 or 429."""
+
+
 def write_json(path, obj):
     temporary = path.with_suffix(path.suffix + ".part")
     temporary.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    for attempt, wait in enumerate((0, 0.2, 0.5, 1, 2)):
+        if wait:
+            time.sleep(wait)
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
 
 
 def parse_html(path, genji=False):
     """Read asset records from UTokyo search-result HTML, ignoring navigation links."""
     soup = BeautifulSoup(path.read_text(encoding="utf-8-sig"), "html.parser")
     entries, seen_uuids, seen_titles = [], set(), set()
-    for article in soup.select('article[about^="/portal/assets/"]'):
-        asset_id = article.get("about", "").rsplit("/", 1)[-1].lower()
+    for article in soup.select("article[about]"):
+        about = article.get("about", "")
+        match = re.fullmatch(r"/portal/(?:[a-z]{2}/)?assets/([^/]+)", about, re.I)
+        if not match:
+            continue
+        asset_id = match.group(1).lower()
         link = article.select_one('a[rel="bookmark"]')
         title = link.get_text(" ", strip=True) if link else ""
         if not UUID.fullmatch(asset_id) or not title:
@@ -83,7 +99,7 @@ class Http:
                 response = self.session.get(url, timeout=self.timeout, stream=stream)
                 if response.status_code in (403, 429):
                     response.close()
-                    raise PermissionError(f"HTTP {response.status_code} (no automatic retry): {url}")
+                    raise RemoteAccessDenied(f"HTTP {response.status_code} (no automatic retry): {url}")
                 if response.status_code in (500, 502, 503, 504) and attempt < self.retries:
                     response.close()
                     time.sleep(min(2 ** attempt, 8))
@@ -266,7 +282,7 @@ def process_asset(http, root, asset):
         if path is None:
             try:
                 path = get_image(http, url, pictures, number)
-            except PermissionError:
+            except RemoteAccessDenied:
                 raise
             except Exception as exc:
                 LOG.error("%02d %s: image %d failed: %s", asset["number"], asset["title"], number, exc)
@@ -403,7 +419,7 @@ def main():
         except Exception as exc:
             LOG.error("Asset %02d stopped: %s", chapter["number"], exc)
             errors.append({"asset": chapter, "error": str(exc)})
-            if isinstance(exc, PermissionError):
+            if isinstance(exc, RemoteAccessDenied):
                 LOG.error("HTTP 403/429: stopping requests; try again when access is available")
                 break
         write_json(args.output / "errors.json", errors)
